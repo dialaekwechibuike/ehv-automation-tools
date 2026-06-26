@@ -1,12 +1,25 @@
 """
-EHV Automation Project Evaluator
-==================================
+EHV Automation Project Evaluator (AI-Judge edition)
+===================================================
+A reusable evaluator that works for ANY project.
+
+You do NOT write the "correct answer" for each case anymore.
+Instead you just describe your project and list a few example
+situations (cases). When you run it, Claude will:
+
+  1. Read your project description and your listed cases.
+  2. Invent extra creative / edge cases you may have forgotten.
+  3. Decide how the project SHOULD respond to each case.
+  4. Judge each outcome (PASS / CONCERN / FAIL) with reasons.
+  5. Give an overall verdict on the project: score, strengths,
+     weaknesses, risks and recommendations.
+  6. Save a clean markdown report you can send to Florian.
+
 HOW TO USE:
-1. Open this file in Cursor inside your project folder
-2. Fill in the CONFIG section below with your project details
-3. Add your test cases to the TEST_CASES list
-4. Run: python evaluate_project.py
-5. A markdown report is generated and saved — send it to Florian
+  1. Fill in the CONFIG section below (project name + description).
+  2. Add a few example situations to the CASES list
+     (or leave it empty and let Claude invent them all).
+  3. Run:  python evaluate_project.py
 
 REQUIREMENTS:
     pip install anthropic
@@ -16,233 +29,315 @@ REQUIREMENTS:
 import anthropic
 import time
 import os
+import json
+import re
 from datetime import datetime
 
 # ============================================================
 # CONFIG — fill this in for each new project
 # ============================================================
 
-PROJECT_NAME        = "Zahlungserinnerung Workflow"          # Name of your project
-PROJECT_DESCRIPTION = "Automated late-payment reminder system for EHV tenants using n8n, Claude AI, Google Sheets, Amazon SQS, monday.com and Twilio."
-GITHUB_REPO         = "https://github.com/chybyke1992/YOUR_REPO"  # Your GitHub link
+PROJECT_NAME        = "Zahlungserinnerung Workflow"
+PROJECT_DESCRIPTION = (
+    "Automated late-payment reminder system for EHV tenants using n8n, "
+    "Claude AI, Google Sheets, Amazon SQS, monday.com and Twilio. It checks "
+    "which tenants are overdue, decides whether a reminder is needed, "
+    "classifies how urgent it is, and drafts a polite reminder message in German."
+)
+GITHUB_REPO         = "https://github.com/dialaekwechibuike/ehv-automation-tools"
 YOUR_NAME           = "Chibuike Dialaekwe"
 MANAGER_NAME        = "Florian"
 COMPANY             = "Erste Hausverwaltung GmbH"
 MODEL               = "claude-sonnet-4-6"
 
+# How many extra creative / edge cases should Claude invent on its own?
+NUM_EXTRA_CASES     = 4
+
 # ============================================================
-# TEST CASES — define what Claude should classify/generate
-# Format:
-#   "input"    : the text you send to Claude
-#   "expected" : the exact response you expect (used for pass/fail)
-#   "label"    : short description shown in the report
+# CASES — open-ended situations. NO expected answers needed.
+# Just describe the situation in plain language (any language).
+# You can leave this list empty ([]) and Claude will invent them all.
 # ============================================================
 
-TEST_CASES = [
-    {
-        "label": "Test 1 — Identify overdue tenant",
-        "input": "Mieter Hans Mueller hat seine Miete fuer Juni 2026 nicht bezahlt. Soll er eine Zahlungserinnerung erhalten? Antworte nur mit Ja oder Nein.",
-        "expected": "Ja"
-    },
-    {
-        "label": "Test 2 — Skip paid tenant",
-        "input": "Mieter Anna Schmidt hat ihre Miete fuer Juni 2026 vollstaendig bezahlt. Soll sie eine Zahlungserinnerung erhalten? Antworte nur mit Ja oder Nein.",
-        "expected": "Nein"
-    },
-    {
-        "label": "Test 3 — Generate reminder message",
-        "input": "Schreibe eine kurze, hoefliche Zahlungserinnerung auf Deutsch fuer Mieter Klaus Weber, Wohnung 3B, ausstehender Betrag 850 Euro fuer Juni 2026. Maximal 3 Saetze.",
-        "expected": None   # None = no exact match, just checks Claude responds
-    },
-    {
-        "label": "Test 4 — Classify payment status",
-        "input": "Zahlungsstatus: 5 Tage ueberfaellig. Klassifiziere als: Erste Erinnerung, Zweite Mahnung, oder Letzte Mahnung. Antworte nur mit dem Klassifizierungsnamen.",
-        "expected": "Erste Erinnerung"
-    },
-    {
-        "label": "Test 5 — Classify urgent case",
-        "input": "Zahlungsstatus: 32 Tage ueberfaellig. Klassifiziere als: Erste Erinnerung, Zweite Mahnung, oder Letzte Mahnung. Antworte nur mit dem Klassifizierungsnamen.",
-        "expected": "Letzte Mahnung"
-    },
+CASES = [
+    "A tenant has not paid rent for June 2026.",
+    "A tenant has already paid June rent in full and on time.",
+    "A tenant is 5 days overdue on payment.",
+    "A tenant is 32 days overdue and has ignored a previous reminder.",
+    "Draft a polite reminder for a tenant who owes 850 EUR for a flat.",
 ]
 
 # ============================================================
-# PRICING (claude-sonnet-4-6)
+# PRICING (claude-sonnet-4-6) — for the cost estimate in the report
 # ============================================================
 INPUT_COST_PER_M  = 3.00
 OUTPUT_COST_PER_M = 15.00
 
 # ============================================================
-# EVALUATION ENGINE — no need to edit below this line
+# ENGINE — no need to edit anything below this line
 # ============================================================
 
-def run_evaluation():
+def _extract_json(text):
+    """Pull the first JSON object or array out of a model reply."""
+    text = text.strip()
+    # strip ``` fences if present
+    text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    # try direct parse first
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # otherwise grab the first {...} or [...] block
+    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def generate_extra_cases(client, usage):
+    """Ask Claude to invent additional realistic / edge cases."""
+    if NUM_EXTRA_CASES <= 0:
+        return []
+
+    listed = "\n".join("- " + c for c in CASES) if CASES else "(none provided yet)"
+    prompt = (
+        "You are a QA test designer reviewing an automation project.\n\n"
+        "Project name: " + PROJECT_NAME + "\n"
+        "What the project does: " + PROJECT_DESCRIPTION + "\n\n"
+        "The team already plans to test these situations:\n" + listed + "\n\n"
+        "Propose " + str(NUM_EXTRA_CASES) + " ADDITIONAL realistic test "
+        "situations that are NOT already covered above. Focus on edge cases, "
+        "tricky inputs, and things that could make the system behave wrongly.\n"
+        "Return ONLY a JSON array of short plain-language strings. No commentary."
+    )
+    resp = client.messages.create(
+        model=MODEL, max_tokens=700,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    usage["in"]  += resp.usage.input_tokens
+    usage["out"] += resp.usage.output_tokens
+
+    parsed = _extract_json(resp.content[0].text)
+    if isinstance(parsed, list):
+        return [str(x) for x in parsed][:NUM_EXTRA_CASES]
+    return []
+
+
+def run_case(client, scenario, usage):
+    """Ask Claude how the project SHOULD respond to this situation."""
+    prompt = (
+        "You are the AI decision step inside this automation project.\n"
+        "Project: " + PROJECT_NAME + "\n"
+        "What it does: " + PROJECT_DESCRIPTION + "\n\n"
+        "Respond exactly as the automation should for the following situation. "
+        "Be concise and realistic.\n\n"
+        "Situation: " + scenario
+    )
+    t0 = time.time()
+    resp = client.messages.create(
+        model=MODEL, max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    elapsed = time.time() - t0
+    usage["in"]  += resp.usage.input_tokens
+    usage["out"] += resp.usage.output_tokens
+    return resp.content[0].text.strip(), elapsed
+
+
+def evaluate_all(client, items, usage):
+    """Send every (scenario, response) pair to Claude for a verdict."""
+    blocks = []
+    for it in items:
+        blocks.append(
+            "Case " + str(it["index"]) + " (" + it["source"] + "):\n"
+            "Situation: " + it["scenario"] + "\n"
+            "Automation response: " + it["response"]
+        )
+    joined = "\n\n".join(blocks)
+
+    prompt = (
+        "You are a strict but fair QA reviewer for an automation project.\n\n"
+        "Project: " + PROJECT_NAME + "\n"
+        "What it does: " + PROJECT_DESCRIPTION + "\n\n"
+        "Below are test situations and how the automation responded to each. "
+        "Judge whether each response is correct and appropriate for this project, "
+        "then give an overall assessment of the whole project outcome.\n\n"
+        + joined + "\n\n"
+        "Return ONLY valid JSON in exactly this shape:\n"
+        "{\n"
+        '  "overall": {\n'
+        '    "score": <integer 0-10>,\n'
+        '    "summary": "<2-3 sentence verdict>",\n'
+        '    "strengths": ["..."],\n'
+        '    "weaknesses": ["..."],\n'
+        '    "risks": ["..."],\n'
+        '    "recommendations": ["..."]\n'
+        "  },\n"
+        '  "cases": [\n'
+        '    {"index": <int>, "verdict": "PASS|CONCERN|FAIL", "reason": "<one sentence>"}\n'
+        "  ]\n"
+        "}\n"
+        "No text before or after the JSON."
+    )
+    resp = client.messages.create(
+        model=MODEL, max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    usage["in"]  += resp.usage.input_tokens
+    usage["out"] += resp.usage.output_tokens
+    return _extract_json(resp.content[0].text)
+
+
+def build_report(items, verdicts, overall, usage, total_time):
+    now      = datetime.now()
+    date_str = now.strftime("%d %B %Y")
+    fname    = "evaluation_report_" + now.strftime("%Y%m%d_%H%M") + ".md"
+
+    by_index = {}
+    if verdicts:
+        for v in verdicts:
+            by_index[v.get("index")] = v
+
+    cost = usage["in"] / 1_000_000 * INPUT_COST_PER_M + \
+           usage["out"] / 1_000_000 * OUTPUT_COST_PER_M
+
+    L = []
+    L.append("# Project Evaluation Report")
+    L.append("")
+    L.append("**Project:** " + PROJECT_NAME + "  ")
+    L.append("**Prepared by:** " + YOUR_NAME + "  ")
+    L.append("**Submitted to:** " + MANAGER_NAME + ", " + COMPANY + "  ")
+    L.append("**Date:** " + date_str + "  ")
+    L.append("**GitHub:** " + GITHUB_REPO + "  ")
+    L.append("")
+    L.append("---")
+    L.append("")
+    L.append("## Project Overview")
+    L.append("")
+    L.append(PROJECT_DESCRIPTION)
+    L.append("")
+    L.append("---")
+    L.append("")
+    L.append("## Overall Verdict")
+    L.append("")
+    if overall:
+        L.append("**Score:** " + str(overall.get("score", "n/a")) + " / 10")
+        L.append("")
+        L.append(overall.get("summary", ""))
+        L.append("")
+        for title, key in [("Strengths", "strengths"),
+                           ("Weaknesses", "weaknesses"),
+                           ("Risks", "risks"),
+                           ("Recommendations", "recommendations")]:
+            vals = overall.get(key) or []
+            if vals:
+                L.append("**" + title + ":**")
+                L.append("")
+                for v in vals:
+                    L.append("- " + str(v))
+                L.append("")
+    else:
+        L.append("_Claude did not return a structured overall verdict; "
+                 "see raw case results below._")
+        L.append("")
+    L.append("---")
+    L.append("")
+    L.append("## Case-by-Case Results")
+    L.append("")
+    for it in items:
+        v = by_index.get(it["index"], {})
+        verdict = v.get("verdict", "—")
+        reason  = v.get("reason", "")
+        L.append("### [" + verdict + "] Case " + str(it["index"]) +
+                 " (" + it["source"] + ")")
+        L.append("")
+        L.append("**Situation:**")
+        L.append("> " + it["scenario"])
+        L.append("")
+        L.append("**Automation response:**")
+        L.append("> " + it["response"].replace("\n", "\n> "))
+        L.append("")
+        if reason:
+            L.append("**Reviewer note:** " + reason)
+            L.append("")
+        L.append("---")
+        L.append("")
+    L.append("## Run Stats")
+    L.append("")
+    L.append("| Metric | Value |")
+    L.append("|--------|-------|")
+    L.append("| Model used | `" + MODEL + "` |")
+    L.append("| Cases evaluated | " + str(len(items)) + " |")
+    L.append("| Input tokens | " + format(usage["in"], ",") + " |")
+    L.append("| Output tokens | " + format(usage["out"], ",") + " |")
+    L.append("| Estimated API cost | $" + format(cost, ".6f") + " USD |")
+    L.append("| Total run time | " + format(total_time, ".2f") + "s |")
+    L.append("")
+    L.append("---")
+    L.append("*Report auto-generated by evaluate_project.py (AI-Judge edition)*")
+
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    return fname
+
+
+def main():
     client = anthropic.Anthropic()
+    usage  = {"in": 0, "out": 0}
+    t_start = time.time()
 
-    results = []
-    total_input_tokens  = 0
-    total_output_tokens = 0
-    total_time          = 0.0
-    correct             = 0
-    skipped             = 0
-
-    print(f"\nRunning evaluation for: {PROJECT_NAME}")
+    print("\nEvaluating project: " + PROJECT_NAME)
     print("=" * 55)
 
-    for i, tc in enumerate(TEST_CASES, 1):
-        t0 = time.time()
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=200,
-            messages=[{"role": "user", "content": tc["input"]}],
-        )
-        elapsed = time.time() - t0
+    # 1. Gather cases: the ones you listed + ones Claude invents
+    items = []
+    idx = 0
+    for c in CASES:
+        idx += 1
+        items.append({"index": idx, "scenario": c, "source": "listed"})
 
-        raw_text  = response.content[0].text.strip()
-        predicted = raw_text.split("\n")[0].strip()
-        in_tok    = response.usage.input_tokens
-        out_tok   = response.usage.output_tokens
+    print("Asking Claude to invent extra cases...")
+    extra = generate_extra_cases(client, usage)
+    for c in extra:
+        idx += 1
+        items.append({"index": idx, "scenario": c, "source": "AI-generated"})
 
-        if tc["expected"] is None:
-            passed  = len(predicted) > 0
-            skipped += 1
-            status  = "OPEN"
-        else:
-            passed = predicted.lower() == tc["expected"].lower()
-            if passed:
-                correct += 1
-            status = "PASS" if passed else "FAIL"
+    if not items:
+        print("No cases to evaluate. Add some to CASES or set NUM_EXTRA_CASES > 0.")
+        return
 
-        total_input_tokens  += in_tok
-        total_output_tokens += out_tok
-        total_time          += elapsed
+    # 2. Get the automation's response for each case
+    for it in items:
+        resp_text, _ = run_case(client, it["scenario"], usage)
+        it["response"] = resp_text
+        print("  [done] Case " + str(it["index"]) + " (" + it["source"] + ")")
 
-        results.append({
-            "index":     i,
-            "label":     tc["label"],
-            "input":     tc["input"],
-            "expected":  tc["expected"] if tc["expected"] else "(open-ended)",
-            "predicted": predicted,
-            "full_response": raw_text,
-            "passed":    passed,
-            "status":    status,
-            "in_tok":    in_tok,
-            "out_tok":   out_tok,
-            "time_s":    elapsed,
-        })
+    # 3. Have Claude judge everything
+    print("Asking Claude for the overall verdict...")
+    result   = evaluate_all(client, items, usage)
+    overall  = result.get("overall") if isinstance(result, dict) else None
+    verdicts = result.get("cases")   if isinstance(result, dict) else None
 
-        print(f"[{status}] {tc['label']}")
+    total_time = time.time() - t_start
 
-    # Summary metrics
-    exact_cases    = len(TEST_CASES) - skipped
-    accuracy       = (correct / exact_cases * 100) if exact_cases > 0 else 0
-    estimated_cost = (
-        total_input_tokens  / 1_000_000 * INPUT_COST_PER_M
-        + total_output_tokens / 1_000_000 * OUTPUT_COST_PER_M
-    )
-    avg_time = total_time / len(TEST_CASES)
+    # 4. Write the report
+    report_file = build_report(items, verdicts, overall, usage, total_time)
 
-    return results, {
-        "accuracy":         accuracy,
-        "correct":          correct,
-        "exact_cases":      exact_cases,
-        "skipped":          skipped,
-        "total_input_tok":  total_input_tokens,
-        "total_output_tok": total_output_tokens,
-        "estimated_cost":   estimated_cost,
-        "avg_time":         avg_time,
-        "total_time":       total_time,
-    }
-
-
-def generate_report(results, metrics):
-    now       = datetime.now()
-    date_str  = now.strftime("%d %B %Y")
-    file_name = f"evaluation_report_{now.strftime('%Y%m%d_%H%M')}.md"
-
-    lines = []
-    lines.append(f"# Project Evaluation Report")
-    lines.append(f"")
-    lines.append(f"**Project:** {PROJECT_NAME}  ")
-    lines.append(f"**Prepared by:** {YOUR_NAME}  ")
-    lines.append(f"**Submitted to:** {MANAGER_NAME}, {COMPANY}  ")
-    lines.append(f"**Date:** {date_str}  ")
-    lines.append(f"**GitHub:** {GITHUB_REPO}  ")
-    lines.append(f"")
-    lines.append(f"---")
-    lines.append(f"")
-    lines.append(f"## Project Overview")
-    lines.append(f"")
-    lines.append(f"{PROJECT_DESCRIPTION}")
-    lines.append(f"")
-    lines.append(f"---")
-    lines.append(f"")
-    lines.append(f"## Evaluation Summary")
-    lines.append(f"")
-    lines.append(f"| Metric | Value |")
-    lines.append(f"|--------|-------|")
-    lines.append(f"| Model used | `{MODEL}` |")
-    lines.append(f"| Total test cases | {len(TEST_CASES)} |")
-    lines.append(f"| Exact match tests | {metrics['exact_cases']} |")
-    lines.append(f"| Open-ended tests | {metrics['skipped']} |")
-    lines.append(f"| Correct (exact) | {metrics['correct']} / {metrics['exact_cases']} |")
-    lines.append(f"| **Accuracy** | **{metrics['accuracy']:.1f}%** |")
-    lines.append(f"| Total input tokens | {metrics['total_input_tok']:,} |")
-    lines.append(f"| Total output tokens | {metrics['total_output_tok']:,} |")
-    lines.append(f"| Estimated API cost | ${metrics['estimated_cost']:.6f} USD |")
-    lines.append(f"| Avg response time | {metrics['avg_time']:.2f}s |")
-    lines.append(f"| Total run time | {metrics['total_time']:.2f}s |")
-    lines.append(f"")
-    lines.append(f"---")
-    lines.append(f"")
-    lines.append(f"## Test Case Results")
-    lines.append(f"")
-
-    for r in results:
-        badge = {"PASS": "PASS", "FAIL": "FAIL", "OPEN": "OPEN"}[r["status"]]
-        lines.append(f"### [{badge}] {r['label']}")
-        lines.append(f"")
-        lines.append(f"**Input prompt:**")
-        lines.append(f"> {r['input']}")
-        lines.append(f"")
-        lines.append(f"**Expected:** `{r['expected']}`  ")
-        lines.append(f"**Claude responded:** `{r['predicted']}`  ")
-        if r["status"] == "OPEN":
-            lines.append(f"")
-            lines.append(f"**Full response:**")
-            lines.append(f"> {r['full_response']}")
-        lines.append(f"")
-        lines.append(f"*Tokens: {r['in_tok']} in / {r['out_tok']} out | Response time: {r['time_s']:.2f}s*")
-        lines.append(f"")
-        lines.append(f"---")
-        lines.append(f"")
-
-    lines.append(f"## Notes")
-    lines.append(f"")
-    lines.append(f"- All tests were run against live Claude API (`{MODEL}`).")
-    lines.append(f"- Open-ended tests (marked OPEN) were checked only for a non-empty response.")
-    lines.append(f"- Cost estimate based on Anthropic pricing: $3.00 / 1M input tokens, $15.00 / 1M output tokens.")
-    lines.append(f"")
-    lines.append(f"---")
-    lines.append(f"*Report auto-generated by evaluate_project.py*")
-
-    report_text = "\n".join(lines)
-
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(report_text)
-
-    return file_name
+    print("\n" + "=" * 55)
+    if overall:
+        print("  Overall score : " + str(overall.get("score", "n/a")) + " / 10")
+    print("  Cases         : " + str(len(items)))
+    cost = usage["in"] / 1_000_000 * INPUT_COST_PER_M + \
+           usage["out"] / 1_000_000 * OUTPUT_COST_PER_M
+    print("  Est. cost     : $" + format(cost, ".6f") + " USD")
+    print("=" * 55)
+    print("\nReport saved: " + report_file)
+    print("Send this file to Florian.")
 
 
 if __name__ == "__main__":
-    results, metrics = run_evaluation()
-    report_file      = generate_report(results, metrics)
-
-    print("\n" + "=" * 55)
-    print(f"  Accuracy      : {metrics['accuracy']:.1f}%")
-    print(f"  Correct       : {metrics['correct']} / {metrics['exact_cases']}")
-    print(f"  Est. cost     : ${metrics['estimated_cost']:.6f} USD")
-    print(f"  Avg time      : {metrics['avg_time']:.2f}s")
-    print("=" * 55)
-    print(f"\nReport saved: {report_file}")
-    print("Send this file to Florian.")
+    main()
