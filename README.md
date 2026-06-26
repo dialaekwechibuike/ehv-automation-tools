@@ -21,20 +21,21 @@ ehv-automation-tools/
 
 ## evaluate_project.py
 
-A reusable **AI-assisted project evaluator** for n8n and similar automations.
+A reusable **AI-assisted project evaluator** for any n8n workflow or automation.
 
-When you finish any EHV automation project:
+When you finish any project:
 
-1. Open `evaluator/evaluate_project.py` in Cursor
-2. Fill in the CONFIG section (project name + description)
-3. Add a few test situations to `CASES` (or leave empty for AI-generated cases)
-4. Run the script — a markdown report is auto-generated
-5. Send the report to Florian
+1. Open `evaluator/evaluate_project.py`
+2. Fill in **only** `PROJECT_NAME` and `PROJECT_DESCRIPTION`
+3. Run the script — test cases are invented automatically
+4. Send the generated markdown report to Florian
+
+You do **not** write test cases manually.
 
 ### What it does
 
-- Invents edge cases you may not have thought of
-- Simulates expected automation behaviour from your description
+- Invents a full set of test situations from your project description
+- Simulates expected automation behaviour for each situation
 - Independently judges each case (PASS / CONCERN / FAIL)
 - Produces a manager-ready report with score, risks, and recommendations
 
@@ -52,14 +53,7 @@ export ANTHROPIC_API_KEY=your_key_here
 python evaluator/evaluate_project.py
 ```
 
-### Example cases (format)
+### Optional tuning
 
-```python
-CASES = [
-    "A tenant emails about a burst pipe at 11pm and marks it urgent.",
-    "A marketing newsletter arrives in the shared inbox with no tenant ID.",
-    "Two emails about the same heating issue arrive 5 minutes apart.",
-]
-```
-
-Replace these with situations that match **your** project before running.
+Change `NUM_TEST_CASES` in the script if you want more or fewer auto-generated
+test situations. The default is `6`.

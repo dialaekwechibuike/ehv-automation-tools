@@ -47,7 +47,8 @@ Confirm the file is saved and the path is correct.
 Before running, edit the CONFIG section in the script:
 - Set `PROJECT_NAME`
 - Set `PROJECT_DESCRIPTION`
-- Optionally add real situations to `CASES`
+
+Do not add manual test cases. The script generates them automatically.
 
 Then run:
 ```bash

@@ -1,15 +1,14 @@
 """
 EHV Automation Project Evaluator (AI-Judge edition)
 ===================================================
-A reusable evaluator that works for ANY automation project.
+A reusable evaluator for ANY automation project or workflow.
 
-You do NOT write the "correct answer" for each case anymore.
-Instead you describe your project and list a few example situations
-(cases). When you run it, Claude will:
+You only fill in two CONFIG lines (project name + description).
+You do NOT add test cases manually. When you run the script, Claude will:
 
-  1. Read your project description and your listed cases.
-  2. Invent extra creative / edge cases you may have forgotten.
-  3. Simulate how the automation SHOULD respond to each case.
+  1. Read your project description.
+  2. Invent a full set of realistic test situations for that project.
+  3. Simulate how the automation SHOULD respond to each situation.
   4. Independently judge each outcome (PASS / CONCERN / FAIL).
   5. Give an overall verdict: score, strengths, weaknesses, risks,
      and recommendations.
@@ -19,13 +18,11 @@ IMPORTANT — what this tool does and does NOT do:
   - DOES: scenario planning, edge-case discovery, structured QA writeups.
   - DOES NOT: call your live n8n workflow, webhook, or production APIs.
   Responses are AI-simulated from your project description, not from
-  the real automation. Say so clearly when you submit the report.
+  the real automation. The report states this clearly.
 
 HOW TO USE:
-  1. Fill in the CONFIG section below (project name + description).
-  2. Add a few example situations to the CASES list
-     (or leave it empty and let Claude invent them all).
-  3. Run:  python evaluate_project.py
+  1. Fill in PROJECT_NAME and PROJECT_DESCRIPTION in the CONFIG section.
+  2. Run:  python evaluate_project.py
 
 REQUIREMENTS:
     pip install anthropic
@@ -44,7 +41,7 @@ from datetime import datetime
 # CONFIG — fill this in for each new project
 # ============================================================
 
-# --- Change these lines for each new project ------------------
+# --- Change ONLY these two lines for each new project ---------
 PROJECT_NAME = "PUT YOUR PROJECT NAME HERE"
 PROJECT_DESCRIPTION = (
     "Describe in 1-3 sentences what this project does, what it decides, "
@@ -58,30 +55,11 @@ MANAGER_NAME = "Florian"
 COMPANY = "Erste Hausverwaltung GmbH"
 MODEL = "claude-sonnet-4-6"
 
-# How many extra creative / edge cases should Claude invent on its own?
-NUM_EXTRA_CASES = 4
+# How many test situations Claude should invent from the description alone.
+NUM_TEST_CASES = 6
 
 # Retry JSON parsing this many times when the model returns bad JSON.
 JSON_PARSE_RETRIES = 2
-
-# ============================================================
-# CASES — open-ended situations for THIS project. NO answers needed.
-# Just describe situations in plain language (German or English is fine).
-#
-# Leave CASES = [] to let Claude invent all test cases from the
-# PROJECT_DESCRIPTION above.
-#
-# Example format for a tenant-email routing workflow (replace with yours):
-# CASES = [
-#     "A tenant emails about a burst pipe at 11pm and marks it urgent.",
-#     "A marketing newsletter arrives in the shared inbox with no tenant ID.",
-#     "Two emails about the same heating issue arrive 5 minutes apart.",
-#     "An email is in German and mentions 'Wasserschaden' but no apartment number.",
-#     "A tenant forwards a long thread; only the oldest message has the unit number.",
-# ]
-# ============================================================
-
-CASES = []
 
 # ============================================================
 # PRICING (claude-sonnet-4-6) — for the cost estimate in the report
@@ -131,11 +109,10 @@ def _call_model(client, prompt, max_tokens, usage):
 def _call_model_json(client, prompt, max_tokens, usage, expect, label, warnings):
     """Call the model and parse JSON, retrying on failure."""
     current_prompt = prompt
-    last_text = ""
 
     for attempt in range(JSON_PARSE_RETRIES + 1):
-        last_text = _call_model(client, current_prompt, max_tokens, usage)
-        parsed = _extract_json(last_text)
+        text = _call_model(client, current_prompt, max_tokens, usage)
+        parsed = _extract_json(text)
         if expect == "list" and isinstance(parsed, list):
             return parsed
         if expect == "dict" and isinstance(parsed, dict):
@@ -151,7 +128,8 @@ def _call_model_json(client, prompt, max_tokens, usage, expect, label, warnings)
             )
 
     warnings.append(
-        label + " failed after "
+        label
+        + " failed after "
         + str(JSON_PARSE_RETRIES + 1)
         + " attempt(s); continuing with partial results."
     )
@@ -166,48 +144,48 @@ def validate_config():
         m in PROJECT_DESCRIPTION for m in PLACEHOLDER_MARKERS
     ):
         errors.append("Set PROJECT_DESCRIPTION to a concrete project summary.")
-    if NUM_EXTRA_CASES < 0:
-        errors.append("NUM_EXTRA_CASES must be zero or greater.")
+    if NUM_TEST_CASES <= 0:
+        errors.append("NUM_TEST_CASES must be greater than zero.")
     return errors
 
 
-def generate_extra_cases(client, usage, warnings):
-    """Ask Claude to invent additional realistic / edge cases."""
-    if NUM_EXTRA_CASES <= 0:
-        return []
-
-    listed = "\n".join("- " + c for c in CASES) if CASES else "(none provided yet)"
+def generate_test_cases(client, usage, warnings):
+    """Invent a balanced set of test situations from the project description."""
     prompt = (
-        "You are a QA test designer reviewing a property-management automation "
-        "project for Erste Hausverwaltung GmbH.\n\n"
+        "You are a senior QA test designer reviewing an automation project.\n\n"
         "Project name: "
         + PROJECT_NAME
         + "\n"
         "What the project does: "
         + PROJECT_DESCRIPTION
         + "\n\n"
-        "The team already plans to test these situations:\n"
-        + listed
-        + "\n\n"
-        "Propose "
-        + str(NUM_EXTRA_CASES)
-        + " ADDITIONAL realistic test situations that are NOT already covered. "
-        "Focus on edge cases, ambiguous inputs, duplicate messages, missing data, "
-        "after-hours urgency, multilingual content, and failure modes.\n"
-        "Each case should be one short plain-language sentence.\n"
-        "Return ONLY a JSON array of strings. No commentary."
+        "Design exactly "
+        + str(NUM_TEST_CASES)
+        + " test situations tailored to THIS project. Cover a mix of:\n"
+        "- normal expected inputs\n"
+        "- edge cases and ambiguous inputs\n"
+        "- missing, invalid, or duplicate data\n"
+        "- timing, retries, or integration failures\n"
+        "- cases that should escalate to a human or stop safely\n\n"
+        "Write each situation as one short plain-language sentence. "
+        "Do not assume a specific industry unless the project description "
+        "already implies one.\n"
+        "Return ONLY a JSON array of "
+        + str(NUM_TEST_CASES)
+        + " strings. No commentary."
     )
     parsed = _call_model_json(
         client,
         prompt,
-        700,
+        900,
         usage,
         "list",
-        "Extra case generation",
+        "Test case generation",
         warnings,
     )
     if isinstance(parsed, list):
-        return [str(x) for x in parsed][:NUM_EXTRA_CASES]
+        cases = [str(x).strip() for x in parsed if str(x).strip()]
+        return cases[:NUM_TEST_CASES]
     return []
 
 
@@ -223,7 +201,7 @@ def run_case(client, scenario, usage):
         + "\n\n"
         "Based only on the project description, respond exactly as the automation "
         "SHOULD for the following situation. Be concise, realistic, and specific "
-        "about actions (route, tag, notify, escalate, ignore, request info, etc.).\n\n"
+        "about the actions the workflow would take.\n\n"
         "Situation: "
         + scenario
     )
@@ -240,9 +218,7 @@ def evaluate_all(client, items, usage, warnings):
         blocks.append(
             "Case "
             + str(it["index"])
-            + " ("
-            + it["source"]
-            + "):\n"
+            + ":\n"
             "Situation: "
             + it["scenario"]
             + "\n"
@@ -260,7 +236,7 @@ def evaluate_all(client, items, usage, warnings):
         + PROJECT_DESCRIPTION
         + "\n\n"
         "IMPORTANT: The responses below were AI-SIMULATED from the project "
-        "description. They were NOT produced by the live n8n workflow. "
+        "description. They were NOT produced by the live workflow. "
         "Judge each response against what the project SHOULD do in production. "
         "Be strict and skeptical — do not assume the simulated response is "
         "correct just because it sounds plausible.\n\n"
@@ -324,9 +300,9 @@ def build_report(items, verdicts, overall, usage, total_time, warnings):
     lines.append("")
     lines.append(
         "This report was generated by `evaluate_project.py` using AI-assisted "
-        "scenario review. Claude invented and/or reviewed test situations, "
-        "simulated expected automation behaviour from the project description, "
-        "and independently judged those simulated outcomes."
+        "scenario review. Claude invented test situations from the project "
+        "description, simulated expected automation behaviour, and "
+        "independently judged those simulated outcomes."
     )
     lines.append("")
     lines.append(
@@ -335,7 +311,7 @@ def build_report(items, verdicts, overall, usage, total_time, warnings):
     )
     lines.append("")
     lines.append(
-        "**What this report does NOT prove:** that the live n8n workflow, "
+        "**What this report does NOT prove:** that the live workflow, "
         "webhooks, or integrations were executed. Validate critical paths "
         "against the real automation before production use."
     )
@@ -388,15 +364,7 @@ def build_report(items, verdicts, overall, usage, total_time, warnings):
         v = by_index.get(it["index"], {})
         verdict = v.get("verdict", "—")
         reason = v.get("reason", "")
-        lines.append(
-            "### ["
-            + verdict
-            + "] Case "
-            + str(it["index"])
-            + " ("
-            + it["source"]
-            + ")"
-        )
+        lines.append("### [" + verdict + "] Case " + str(it["index"]))
         lines.append("")
         lines.append("**Situation:**")
         lines.append("> " + it["scenario"])
@@ -414,8 +382,7 @@ def build_report(items, verdicts, overall, usage, total_time, warnings):
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
     lines.append("| Model used | `" + MODEL + "` |")
-    lines.append("| Listed cases | " + str(len(CASES)) + " |")
-    lines.append("| Total cases evaluated | " + str(len(items)) + " |")
+    lines.append("| Auto-generated test cases | " + str(len(items)) + " |")
     lines.append("| Input tokens | " + format(usage["in"], ",") + " |")
     lines.append("| Output tokens | " + format(usage["out"], ",") + " |")
     lines.append("| Estimated API cost | $" + format(cost, ".6f") + " USD |")
@@ -435,7 +402,7 @@ def main():
         print("\nConfiguration error(s):")
         for err in config_errors:
             print("  - " + err)
-        print("\nEdit the CONFIG section at the top of evaluate_project.py and run again.")
+        print("\nEdit PROJECT_NAME and PROJECT_DESCRIPTION at the top of the file.")
         sys.exit(1)
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -449,29 +416,24 @@ def main():
     t_start = time.time()
 
     print("\nEvaluating project: " + PROJECT_NAME)
-    print("Mode: AI-simulated scenario review (not live n8n execution)")
+    print("Mode: AI-simulated scenario review (not live workflow execution)")
     print("=" * 55)
 
-    items = []
-    idx = 0
-    for case in CASES:
-        idx += 1
-        items.append({"index": idx, "scenario": case, "source": "listed"})
-
-    print("Asking Claude to invent extra cases...")
-    extra = generate_extra_cases(client, usage, warnings)
-    for case in extra:
-        idx += 1
-        items.append({"index": idx, "scenario": case, "source": "AI-generated"})
-
-    if not items:
-        print("No cases to evaluate. Add some to CASES or set NUM_EXTRA_CASES > 0.")
+    print("Generating test cases from project description...")
+    cases = generate_test_cases(client, usage, warnings)
+    if not cases:
+        print("No test cases were generated. Check PROJECT_DESCRIPTION and try again.")
         sys.exit(1)
+
+    items = []
+    for idx, scenario in enumerate(cases, start=1):
+        items.append({"index": idx, "scenario": scenario})
+        print("  [case " + str(idx) + "] " + scenario)
 
     for it in items:
         resp_text, _ = run_case(client, it["scenario"], usage)
         it["response"] = resp_text
-        print("  [done] Case " + str(it["index"]) + " (" + it["source"] + ")")
+        print("  [simulated] Case " + str(it["index"]))
 
     print("Asking Claude for the independent overall verdict...")
     result = evaluate_all(client, items, usage, warnings)
