@@ -37,13 +37,11 @@ from datetime import datetime
 # CONFIG — fill this in for each new project
 # ============================================================
 
-PROJECT_NAME        = "Zahlungserinnerung Workflow"
-PROJECT_DESCRIPTION = (
-    "Automated late-payment reminder system for EHV tenants using n8n, "
-    "Claude AI, Google Sheets, Amazon SQS, monday.com and Twilio. It checks "
-    "which tenants are overdue, decides whether a reminder is needed, "
-    "classifies how urgent it is, and drafts a polite reminder message in German."
-)
+# --- Change ONLY these two lines for each new project ---------
+PROJECT_NAME        = "PUT YOUR PROJECT NAME HERE"
+PROJECT_DESCRIPTION = "Describe in 1-3 sentences what this project does, what it decides, and which tools it uses."
+# --------------------------------------------------------------
+
 GITHUB_REPO         = "https://github.com/dialaekwechibuike/ehv-automation-tools"
 YOUR_NAME           = "Chibuike Dialaekwe"
 MANAGER_NAME        = "Florian"
@@ -54,18 +52,19 @@ MODEL               = "claude-sonnet-4-6"
 NUM_EXTRA_CASES     = 4
 
 # ============================================================
-# CASES — open-ended situations. NO expected answers needed.
-# Just describe the situation in plain language (any language).
-# You can leave this list empty ([]) and Claude will invent them all.
+# CASES — open-ended situations for THIS project. NO answers needed.
+# Just describe situations in plain language (any language).
+#
+# You can also leave this list completely empty:  CASES = []
+# and Claude will invent all the test cases for you from the
+# PROJECT_DESCRIPTION above.
+#
+# Example of the format (delete these and write your own):
+#   "Describe a normal, expected situation for your project.",
+#   "Describe an unusual or tricky situation.",
 # ============================================================
 
-CASES = [
-    "A tenant has not paid rent for June 2026.",
-    "A tenant has already paid June rent in full and on time.",
-    "A tenant is 5 days overdue on payment.",
-    "A tenant is 32 days overdue and has ignored a previous reminder.",
-    "Draft a polite reminder for a tenant who owes 850 EUR for a flat.",
-]
+CASES = []
 
 # ============================================================
 # PRICING (claude-sonnet-4-6) — for the cost estimate in the report
