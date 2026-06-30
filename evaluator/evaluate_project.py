@@ -37,6 +37,11 @@ import sys
 import time
 from datetime import datetime
 
+# Maximum back-off attempts for transient API errors (rate limits, 5xx, network).
+API_MAX_RETRIES = 4
+# Initial wait in seconds before the first retry; doubles each attempt.
+API_BACKOFF_BASE = 2
+
 # ============================================================
 # CONFIG — fill this in for each new project
 # ============================================================
@@ -80,52 +85,97 @@ PLACEHOLDER_MARKERS = (
 def _extract_json(text):
     """Pull the first JSON object or array out of a model reply."""
     text = text.strip()
+    # Strip fenced code blocks (```json ... ``` or ``` ... ```)
     text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+    # Non-greedy match to avoid capturing unrelated trailing braces/brackets.
+    match = re.search(r"(\{.*?\}|\[.*?\])", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
-            return None
+            # Last-ditch: try to find the largest balanced JSON blob.
+            for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
+                m = re.search(pattern, text)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except json.JSONDecodeError:
+                        pass
     return None
 
 
 def _call_model(client, prompt, max_tokens, usage):
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
+    """Call the model with exponential-backoff retry on transient errors."""
+    last_exc = None
+    for attempt in range(API_MAX_RETRIES + 1):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.RateLimitError as exc:
+            last_exc = exc
+            wait = API_BACKOFF_BASE * (2 ** attempt)
+            print(f"  [rate-limit] Waiting {wait}s before retry {attempt + 1}/{API_MAX_RETRIES}...")
+            time.sleep(wait)
+            continue
+        except (anthropic.APIConnectionError, anthropic.InternalServerError) as exc:
+            last_exc = exc
+            wait = API_BACKOFF_BASE * (2 ** attempt)
+            print(f"  [api-error] {exc.__class__.__name__}: retrying in {wait}s ({attempt + 1}/{API_MAX_RETRIES})...")
+            time.sleep(wait)
+            continue
+        except anthropic.APIStatusError as exc:
+            # Non-retryable status errors (e.g. 400 bad request, 401 auth).
+            raise RuntimeError(f"API error {exc.status_code}: {exc.message}") from exc
+
+        # Validate content before indexing to avoid IndexError on empty responses.
+        if not resp.content or not hasattr(resp.content[0], "text"):
+            last_exc = ValueError("API returned an empty content list.")
+            wait = API_BACKOFF_BASE * (2 ** attempt)
+            print(f"  [empty-response] Retrying in {wait}s ({attempt + 1}/{API_MAX_RETRIES})...")
+            time.sleep(wait)
+            continue
+
+        usage["in"] += resp.usage.input_tokens
+        usage["out"] += resp.usage.output_tokens
+        return resp.content[0].text.strip()
+
+    raise RuntimeError(
+        f"API call failed after {API_MAX_RETRIES + 1} attempts. Last error: {last_exc}"
     )
-    usage["in"] += resp.usage.input_tokens
-    usage["out"] += resp.usage.output_tokens
-    return resp.content[0].text.strip()
 
 
 def _call_model_json(client, prompt, max_tokens, usage, expect, label, warnings):
     """Call the model and parse JSON, retrying on failure."""
-    current_prompt = prompt
-
+    last_text = ""
     for attempt in range(JSON_PARSE_RETRIES + 1):
-        text = _call_model(client, current_prompt, max_tokens, usage)
-        parsed = _extract_json(text)
-        if expect == "list" and isinstance(parsed, list):
-            return parsed
-        if expect == "dict" and isinstance(parsed, dict):
-            return parsed
-        if attempt < JSON_PARSE_RETRIES:
+        # On retries, show the model exactly what it returned so it can fix it.
+        if attempt == 0:
+            current_prompt = prompt
+        else:
             current_prompt = (
                 prompt
                 + "\n\nYour previous reply was not valid "
                 + expect
-                + ". Return ONLY valid "
+                + " JSON. Here is what you returned:\n"
+                + last_text
+                + "\n\nReturn ONLY valid "
                 + expect
                 + " JSON with no commentary."
             )
+        last_text = _call_model(client, current_prompt, max_tokens, usage)
+        parsed = _extract_json(last_text)
+        if expect == "list" and isinstance(parsed, list):
+            return parsed
+        if expect == "dict" and isinstance(parsed, dict):
+            return parsed
 
     warnings.append(
         label
@@ -207,12 +257,22 @@ def run_case(client, scenario, usage):
     )
     t0 = time.time()
     response = _call_model(client, prompt, 400, usage)
-    elapsed = time.time() - t0
+    elapsed = round(time.time() - t0, 2)
     return response, elapsed
 
 
 def evaluate_all(client, items, usage, warnings):
     """Send every (scenario, response) pair to Claude for an independent verdict."""
+    # Each case can use ~200 tokens of output; reserve 400 for the overall block.
+    # Warn early if the budget looks tight instead of silently truncating.
+    min_tokens_needed = len(items) * 200 + 400
+    max_tokens = max(1500, min_tokens_needed)
+    if max_tokens > 4096:
+        warnings.append(
+            f"Large test set ({len(items)} cases) may produce a long evaluation response. "
+            "Consider reducing NUM_TEST_CASES if JSON parsing fails."
+        )
+
     blocks = []
     for it in items:
         blocks.append(
@@ -262,7 +322,7 @@ def evaluate_all(client, items, usage, warnings):
     return _call_model_json(
         client,
         prompt,
-        1500,
+        max_tokens,
         usage,
         "dict",
         "Overall evaluation",
@@ -273,7 +333,8 @@ def evaluate_all(client, items, usage, warnings):
 def build_report(items, verdicts, overall, usage, total_time, warnings):
     now = datetime.now()
     date_str = now.strftime("%d %B %Y")
-    fname = "evaluation_report_" + now.strftime("%Y%m%d_%H%M") + ".md"
+    # Use seconds precision so rapid consecutive runs never overwrite each other.
+    fname = "evaluation_report_" + now.strftime("%Y%m%d_%H%M%S") + ".md"
 
     by_index = {}
     if verdicts:
@@ -375,6 +436,10 @@ def build_report(items, verdicts, overall, usage, total_time, warnings):
         if reason:
             lines.append("**Reviewer note:** " + reason)
             lines.append("")
+        elapsed = it.get("elapsed")
+        if elapsed is not None:
+            lines.append(f"*Response time: {elapsed}s*")
+            lines.append("")
         lines.append("---")
         lines.append("")
     lines.append("## Run Stats")
@@ -410,6 +475,18 @@ def main():
         print("Run: export ANTHROPIC_API_KEY=your_key_here")
         sys.exit(1)
 
+    try:
+        _run()
+    except RuntimeError as exc:
+        print("\n[ERROR] " + str(exc))
+        print("Check your API key, network connection, and try again.")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user. Partial results were not saved.")
+        sys.exit(130)
+
+
+def _run():
     client = anthropic.Anthropic()
     usage = {"in": 0, "out": 0}
     warnings = []
@@ -431,9 +508,10 @@ def main():
         print("  [case " + str(idx) + "] " + scenario)
 
     for it in items:
-        resp_text, _ = run_case(client, it["scenario"], usage)
+        resp_text, elapsed = run_case(client, it["scenario"], usage)
         it["response"] = resp_text
-        print("  [simulated] Case " + str(it["index"]))
+        it["elapsed"] = elapsed
+        print("  [simulated] Case " + str(it["index"]) + " (" + str(elapsed) + "s)")
 
     print("Asking Claude for the independent overall verdict...")
     result = evaluate_all(client, items, usage, warnings)
